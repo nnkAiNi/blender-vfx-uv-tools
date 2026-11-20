@@ -1,7 +1,7 @@
 bl_info = {
     "name": "UV Effects Modifier",
     "author": "Codex",
-    "version": (0, 4, 6),
+    "version": (0, 4, 26),
     "blender": (5, 3, 0),
     "location": "Object > UV Effects",
     "category": "Object",
@@ -250,25 +250,73 @@ def preview_texture_batch(mesh, source, target, origin, bottom, scale, min_u, mi
     return make_batch(shader, "TRIS", {"pos": positions, "texCoord": samples}) if positions else None
 
 
-_SOURCE_PREVIEW_SCALE = 0.55
-
-
-def preview_layout(before, after, width, height):
-    left, bottom, gap = 30, 70, 24
-    side = min(270, (width - 2 * left - gap) / (1 + _SOURCE_PREVIEW_SCALE), height * 0.42)
+def preview_layout(points, width, height):
+    left, bottom = 30, 70
+    side = min(270, width - 2 * left, height * 0.42)
     if side < 72:
         return None
 
     min_u = min_v = 0.0
     max_u = max_v = 1.0
-    for points in (before, after):
-        for u_coord, v_coord in points:
-            min_u = min(min_u, u_coord)
-            max_u = max(max_u, u_coord)
-            min_v = min(min_v, v_coord)
-            max_v = max(max_v, v_coord)
+    for u_coord, v_coord in points:
+        min_u = min(min_u, u_coord)
+        max_u = max(max_u, u_coord)
+        min_v = min(min_v, v_coord)
+        max_v = max(max_v, v_coord)
     scale = side / max(max_u - min_u, max_v - min_v)
-    return left, bottom, gap, side, scale, min_u, min_v
+    return left, bottom, side, scale, min_u, min_v
+
+
+def edit_uv_edges(mesh, name):
+    import bmesh
+
+    editable = bmesh.from_edit_mesh(mesh)
+    layer = editable.loops.layers.uv.get(name)
+    if not layer:
+        return []
+    points = []
+    step = max(1, math.ceil(len(editable.faces) / 6000))
+    for index, face in enumerate(editable.faces):
+        if index % step or face.hide:
+            continue
+        for loop in face.loops:
+            points.extend((tuple(loop[layer].uv), tuple(loop.link_loop_next[layer].uv)))
+    return points
+
+
+def preview_uv_data(context, modifier):
+    obj = context.object
+    mesh = obj.evaluated_get(context.evaluated_depsgraph_get()).data
+    source = parameter(modifier, "Source UV").value
+    target = parameter(modifier, "Output UV").value
+    if context.mode == "EDIT_MESH" and not (modifier.show_viewport and modifier.show_in_editmode
+                                            and mesh.uv_layers.get(target)):
+        source = target = obj.data.uv_layers.active.name if obj.data.uv_layers.active else ""
+    return mesh, source, target
+
+
+def edit_uv_selection(mesh, name, select_mode):
+    import bmesh
+
+    editable = bmesh.from_edit_mesh(mesh)
+    layer = editable.loops.layers.uv.get(name)
+    borders, dots = [], set()
+    if layer is None:
+        return borders, dots
+    vertices, edges, faces = select_mode
+    for face in editable.faces:
+        if face.hide:
+            continue
+        for loop in face.loops:
+            coord = tuple(loop[layer].uv)
+            if (faces and face.select) or (edges and loop.edge.select and not loop.edge.hide):
+                following = tuple(loop.link_loop_next[layer].uv)
+                borders.extend((coord, following))
+                if coord == following:
+                    dots.add(coord)
+            if vertices and loop.vert.select and not loop.vert.hide:
+                dots.add(coord)
+    return borders, dots
 
 
 def draw_uv_preview():
@@ -277,28 +325,34 @@ def draw_uv_preview():
         return
     modifier = active_effect(context)
     region = context.region
-    if not modifier or not region or context.mode != "OBJECT":
+    if not region or (context.mode != "EDIT_MESH" and (context.mode != "OBJECT" or not modifier)):
         return
 
     import blf
     import gpu
     from gpu_extras.batch import batch_for_shader
 
-    obj = context.object
-    mesh = obj.evaluated_get(context.evaluated_depsgraph_get()).data
-    if not mesh:
-        return
-    source = parameter(modifier, "Source UV").value
-    target = parameter(modifier, "Output UV").value
-    before = uv_edges(mesh if source != target and mesh.uv_layers.get(source) else obj.data, source)
-    after = uv_edges(mesh, target)
-    layout = preview_layout(before, after, region.width, region.height)
+    selected_edges, selected_points = [], set()
+    if context.mode == "EDIT_MESH":
+        edit_mesh = context.edit_object.data
+        active = edit_mesh.uv_layers.active
+        target = active.name if active else ""
+        after = edit_uv_edges(edit_mesh, target)
+        selected_edges, selected_points = edit_uv_selection(
+            edit_mesh, target, context.tool_settings.mesh_select_mode
+        )
+    else:
+        mesh, source, target = preview_uv_data(context, modifier)
+        if not mesh:
+            return
+        after = uv_edges(mesh, target)
+    layout = preview_layout([*after, *selected_edges, *selected_points], region.width, region.height)
     if layout is None:
         return
-    left, bottom, gap, side, scale, min_u, min_v = layout
+    left, bottom, side, scale, min_u, min_v = layout
     shader = gpu.shader.from_builtin("UNIFORM_COLOR")
     texture = None
-    if context.window_manager.uv_effects_uv_texture:
+    if context.window_manager.uv_effects_uv_texture and context.mode == "OBJECT":
         image = preview_image(context)
         if image:
             try:
@@ -320,34 +374,39 @@ def draw_uv_preview():
 
     gpu.state.blend_set("ALPHA")
     try:
-        panels = (
-            (before, f"Source: {source}" if before else "Source UV unavailable", (0.54, 0.72, 0.82, 0.45)),
-            (after, f"Output: {target}" if after else "Output UV unavailable", (1.0, 0.56, 0.14, 1.0)),
-        )
-        for index, (points, label, color) in enumerate(panels):
-            ratio = 1.0 if index else _SOURCE_PREVIEW_SCALE
-            panel_side = side * ratio
-            panel_scale = scale * ratio
-            origin = left + (side * _SOURCE_PREVIEW_SCALE + gap if index else 0)
-            batch = None
-            if image_shader:
-                batch = preview_texture_batch(mesh, source, target if index else source, origin, bottom,
-                                              panel_scale, min_u, min_v, image_shader, batch_for_shader)
-            if batch:
-                image_shader.bind()
-                image_shader.uniform_sampler("image", texture)
-                batch.draw(image_shader)
-                label = "Result texture" if index else "Source texture"
-            else:
-                lines(points, origin, panel_scale, color)
-            blf.size(0, 13 if index else 11)
-            if blf.dimensions(0, label)[0] > panel_side:
-                while label and blf.dimensions(0, label + "...")[0] > panel_side:
-                    label = label[:-1]
-                label += "..."
-            blf.position(0, origin, bottom + panel_side + 12, 0)
-            blf.color(0, *color)
-            blf.draw(0, label)
+        color = (1.0, 0.56, 0.14, 1.0)
+        label = f"UV: {target}" if after else "UV unavailable"
+        batch = preview_texture_batch(mesh, source, target, left, bottom, scale,
+                                      min_u, min_v, image_shader, batch_for_shader) if image_shader else None
+        if batch:
+            image_shader.bind()
+            image_shader.uniform_sampler("image", texture)
+            batch.draw(image_shader)
+            label = "Result texture"
+        else:
+            lines(after, left, scale, (1.0, 0.56, 0.14, 0.4) if selected_edges or selected_points else color)
+            collapsed = {first for first, second in zip(after[::2], after[1::2]) if first == second}
+            highlight = (0.35, 1.0, 0.75, 1.0)
+            lines(selected_edges, left, scale, highlight)
+            for points, tint, size in ((collapsed - selected_points, color, 4.0),
+                                       (selected_points, highlight, 7.0)):
+                if not points:
+                    continue
+                dots = batch_for_shader(shader, "POINTS", {"pos": [
+                    (left + (u - min_u) * scale, bottom + (v - min_v) * scale, 0)
+                    for u, v in points
+                ]})
+                shader.bind()
+                shader.uniform_float("color", tint)
+                gpu.state.point_size_set(size)
+                try:
+                    dots.draw(shader)
+                finally:
+                    gpu.state.point_size_set(1.0)
+        blf.size(0, 13)
+        blf.position(0, left, bottom + side + 12, 0)
+        blf.color(0, *color)
+        blf.draw(0, label)
     finally:
         gpu.state.blend_set("NONE")
 
@@ -823,7 +882,8 @@ class OBJECT_OT_uv_effects_rotate(bpy.types.Operator):
 
 
 class VIEW3D_PT_uv_effects(bpy.types.Panel):
-    bl_label = "UV Effects"
+    bl_label = "UV 编辑"
+    bl_order = 20
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "UV Effects"
@@ -836,18 +896,22 @@ class VIEW3D_PT_uv_effects(bpy.types.Panel):
             layout.label(text="选择模型并添加修改器")
             return
         channels = layout.box()
+        channels.prop(context.window_manager, "uvfx_seams", text="标出 UV 接缝")
+        effect = active_effect(context)
+        if context.window_manager.uvfx_seams and effect:
+            channels.label(text="粉色：原始 UV 断边，不代表纹理一定断开")
+            if context.window_manager.uv_effects_wrap == "EXTEND":
+                channels.label(text="环片周向跨 0–1 时，Clamp 会拉伸边缘", icon="INFO")
         channels.label(text=modifier.name, icon="MOD_UVPROJECT")
         maps = channels.row()
         maps.prop_search(parameter(modifier, "Source UV"), "value",
                          context.object.data, "uv_layers", text="输入")
         maps.prop(parameter(modifier, "Output UV"), "value", text="输出")
         comparison = channels.row(align=True)
-        comparison.prop(context.window_manager, "uv_effects_preview", text="UV 对照")
+        comparison.prop(context.window_manager, "uv_effects_preview", text="结果 UV 预览")
         image_toggle = comparison.row(align=True)
         image_toggle.enabled = context.window_manager.uv_effects_preview
         image_toggle.prop(context.window_manager, "uv_effects_uv_texture", text="显示贴图")
-        if context.mode != "OBJECT":
-            channels.label(text="切到物体模式查看计算结果", icon="INFO")
         if parameter(modifier, "Source UV").value == parameter(modifier, "Output UV").value:
             channels.label(text="输入和输出同名，将覆盖计算结果", icon="ERROR")
         texture = layout.box()
@@ -892,19 +956,14 @@ class VIEW3D_PT_uv_effects(bpy.types.Panel):
             else:
                 texture.label(text="开启结果 UV 预览以编辑渐变", icon="INFO")
         texture.prop(context.window_manager, "uvfx_transparency", text="透明")
-        effects = layout.column()
-        effects.label(text="效果预览")
+        layout.label(text="效果预览")
         settings = context.window_manager
-        vertex_alpha = effects.box()
-        alpha_row = vertex_alpha.row(align=True)
-        alpha_row.prop(settings, "uvfx_vertex_alpha", text="顶点 Alpha 预览")
-        slider = alpha_row.row()
-        slider.enabled = context.mode == "EDIT_MESH"
-        slider.prop(settings, "uvfx_selected_alpha", text="所选 Alpha", slider=True)
-        displacement = effects.box()
-        displacement.prop(settings, "uvfx_displace")
-        if settings.uvfx_displace:
-            fields = displacement.box().column(align=True)
+
+        header, body = layout.panel("uvfx_displacement", default_closed=True)
+        header.prop(settings, "uvfx_displace")
+        if body is not None:
+            fields = body.column(align=True)
+            fields.enabled = settings.uvfx_displace
             fields.prop(settings, "uvfx_height", text="灰度高度图")
             tiling = fields.row(align=True)
             tiling.label(text="Tiling")
@@ -913,24 +972,28 @@ class VIEW3D_PT_uv_effects(bpy.types.Panel):
             fields.prop(settings, "uvfx_height_strength")
             fields.prop(settings, "uvfx_direction")
             fields.prop(settings, "uvfx_vertex_source")
-        distortion = effects.box()
-        distortion.prop(settings, "uvfx_distort")
-        if settings.uvfx_distort:
-            fields = distortion.box().column(align=True)
+        header, body = layout.panel("uvfx_distortion", default_closed=True)
+        header.prop(settings, "uvfx_distort")
+        if body is not None:
+            fields = body.column(align=True)
+            fields.enabled = settings.uvfx_distort
             fields.prop(settings, "uvfx_flow", text="RG 流向图")
             tiling = fields.row(align=True)
             tiling.label(text="Tiling")
             tiling.prop(settings, "uvfx_flow_tiling", index=0, text="X")
             tiling.prop(settings, "uvfx_flow_tiling", index=1, text="Y")
             fields.prop(settings, "uvfx_flow_strength")
-        bloom = effects.box()
+        header, body = layout.panel("uvfx_bloom", default_closed=True)
         compositor = context.scene.compositing_node_group
         if compositor and not compositor.get("uvfx_glow_preview"):
-            bloom.label(text="当前场景有合成节点，不会覆盖", icon="INFO")
+            header.label(text="辉光")
+            if body is not None:
+                body.label(text="当前场景有合成节点，不会覆盖", icon="INFO")
         else:
-            bloom.prop(settings, "uvfx_glow")
-            if settings.uvfx_glow:
-                fields = bloom.box().column(align=True)
+            header.prop(settings, "uvfx_glow")
+            if body is not None:
+                fields = body.column(align=True)
+                fields.enabled = settings.uvfx_glow
                 fields.prop(settings, "uvfx_glow_threshold")
                 fields.prop(settings, "uvfx_glow_strength")
                 fields.prop(settings, "uvfx_glow_color", text="辉光色")
@@ -939,8 +1002,10 @@ class VIEW3D_PT_uv_effects(bpy.types.Panel):
             ("拉伸 / 挤压", "Remap Strength", "Stretch / Squeeze"),
             ("软偏移", "Soft Offset", "Soft Offset Falloff"),
         ):
-            section = layout.box()
-            section.label(text=title)
+            header, section = layout.panel(name, default_closed=True)
+            header.label(text=title)
+            if section is None:
+                continue
             section.prop(parameter(modifier, name), "value", text="强度")
             curve = next(node for node in modifier.node_group.nodes if node.label == label)
             section.template_curve_mapping(curve, "mapping")
@@ -1157,7 +1222,7 @@ class VIEW3D_PT_uvfx_mesh(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "UV Effects"
-    bl_parent_id = "VIEW3D_PT_uv_effects"
+    bl_order = 10
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
@@ -1170,20 +1235,573 @@ class VIEW3D_PT_uvfx_mesh(bpy.types.Panel):
             create.edit_existing = False
         if context.object and context.object.get("uvfx_mesh"):
             layout.operator(OBJECT_OT_uvfx_mesh.bl_idname, text="重设尺寸与分段").edit_existing = True
-        layout.prop(context.window_manager, "uvfx_seams", text="标出 UV 接缝")
-        effect = active_effect(context)
-        if context.window_manager.uvfx_seams and effect:
-            layout.label(text="粉色：原始 UV 断边，不代表纹理一定断开")
-            if context.window_manager.uv_effects_wrap == "EXTEND":
-                layout.label(text="环片周向跨 0–1 时，Clamp 会拉伸边缘", icon="INFO")
+
+
+
+class VIEW3D_PT_uvfx_vertex_color(bpy.types.Panel):
+    bl_label = "顶点色"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "UV Effects"
+    bl_order = 30
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        settings = context.window_manager
+        row = self.layout.row(align=True)
+        row.prop(settings, "uvfx_vertex_alpha", text="顶点 Alpha 预览")
+        slider = row.row()
+        slider.enabled = context.mode == "EDIT_MESH"
+        slider.prop(settings, "uvfx_selected_alpha", text="所选 Alpha", slider=True)
+        if context.mode != "EDIT_MESH":
+            self.layout.label(text="进入编辑模式，选择要修改的顶点")
 
 
 _seam_handle = None
 
 
+def face_uv_topology(editable):
+    import hashlib
+
+    editable.verts.index_update()
+    topology = tuple(tuple(loop.vert.index for loop in face.loops) for face in editable.faces)
+    return hashlib.sha256(repr(topology).encode("ascii")).hexdigest()
+
+
+def refresh_face_uv(context, mesh, name):
+    import bmesh
+
+    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+    modifier = active_effect(context)
+    if modifier:
+        target = parameter(modifier, "Output UV").value
+        if target != name:
+            parameter(modifier, "Source UV").value = name
+        modifier.show_in_editmode = True
+    context.edit_object.update_tag()
+    if context.screen:
+        for area in context.screen.areas:
+            if area.type in {"IMAGE_EDITOR", "VIEW_3D"}:
+                area.tag_redraw()
+
+
+class OBJECT_OT_uvfx_restore_face_uv(bpy.types.Operator):
+    bl_idname = "object.uvfx_restore_face_uv"
+    bl_label = "恢复原始 UV"
+    bl_options = {"UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "EDIT_MESH"
+
+    def execute(self, context):
+        import bmesh
+
+        mesh = context.edit_object.data
+        editable = bmesh.from_edit_mesh(mesh)
+        layer = editable.loops.layers.uv.active
+        name = layer.name if layer else None
+        backups = mesh.get("_uvfx_face_uv_backup")
+        backup = backups.get(name) if name and backups else None
+        if not backup:
+            self.report({"INFO"}, "当前 UV 层没有逐面修改备份")
+            return {"CANCELLED"}
+        if backup["topology"] != face_uv_topology(editable):
+            self.report({"WARNING"}, "拓扑已变化，无法安全恢复 UV")
+            return {"CANCELLED"}
+        coords = iter(backup["coords"])
+        for face in editable.faces:
+            for loop in face.loops:
+                loop[layer].uv = (next(coords), next(coords))
+        refresh_face_uv(context, mesh, name)
+        return {"FINISHED"}
+
+
+_UV_LAYOUT_MODES = {"LINEAR", "RADIAL", "POLAR", "RANDOM"}
+
+
+def shuffle_uv_slots(faces, seed):
+    import random
+
+    bounds = []
+    for index, coords in faces.items():
+        min_u = min(u for u, _ in coords)
+        max_u = max(u for u, _ in coords)
+        min_v = min(v for _, v in coords)
+        max_v = max(v for _, v in coords)
+        bounds.append((min_u, max_u, min_v, max_v, index))
+
+    tolerance = 1e-7
+    first = bounds[0]
+    width, height = first[1] - first[0], first[3] - first[2]
+    if min(width, height) <= tolerance:
+        return None
+
+    active = []
+    for left, right, bottom, top, _ in sorted(bounds):
+        if abs(right - left - width) > tolerance or abs(top - bottom - height) > tolerance:
+            return None
+        active = [(edge, low, high) for edge, low, high in active if edge - left > tolerance]
+        if any(min(top, high) - max(bottom, low) > tolerance for _, low, high in active):
+            return None
+        active.append((right, bottom, top))
+
+    slots = bounds.copy()
+    random.Random(seed).shuffle(slots)
+    return {index: [(target[0] + (u - left) / (right - left) * (target[1] - target[0]),
+                     target[2] + (v - bottom) / (top - bottom) * (target[3] - target[2]))
+                    for u, v in faces[index]]
+            for (left, right, bottom, top, index), target in zip(bounds, slots)}
+
+
+def build_uv_layout(operator, faces, face_vertices=None):
+    mode = operator.operation
+    if mode == "RANDOM":
+        if operator.random_mode == "SHUFFLE":
+            return shuffle_uv_slots(faces, operator.seed)
+        import random
+
+        def sample(index):
+            generator = random.Random((operator.seed << 32) ^ index)
+            return generator.random(), generator.random()
+
+        result = {}
+        for index, coords in faces.items():
+            if operator.random_mode == "VERTEX":
+                result[index] = [sample(vertex) for vertex in face_vertices[index]]
+            elif operator.random_mode == "FACE_POINT":
+                result[index] = [sample(index)] * len(coords)
+            else:
+                target_u, target_v = sample(index)
+                center_u = sum(u for u, _ in coords) / len(coords)
+                center_v = sum(v for _, v in coords) / len(coords)
+                result[index] = [(u + target_u - center_u, v + target_v - center_v)
+                                 for u, v in coords]
+        return result
+
+    points = [point for coords in faces.values() for point in coords]
+    lower = tuple(min(point[axis] for point in points) for axis in range(2))
+    upper = tuple(max(point[axis] for point in points) for axis in range(2))
+    center = tuple(operator.layout_center) if operator.use_custom_center else (
+        (lower[0] + upper[0]) / 2, (lower[1] + upper[1]) / 2
+    )
+    radius = max(math.dist(point, center) for point in points) if mode != "LINEAR" else 0.0
+    sweep_axis = 0 if operator.sweep_direction in {"RIGHT", "LEFT"} else 1
+    span = upper[sweep_axis] - lower[sweep_axis]
+    flip = operator.sweep_direction in {"LEFT", "DOWN"} if mode == "LINEAR" else operator.reverse_sweep
+    output_axis = 0 if operator.sweep_channel == "U" else 1
+
+    def phase(point):
+        if mode == "LINEAR":
+            value = (point[sweep_axis] - lower[sweep_axis]) / span if span > 1e-10 else 0.0
+        else:
+            value = math.dist(point, center) / radius if radius > 1e-10 else 0.0
+        return 1.0 - value if flip else value
+
+    result = {}
+    for index, coords in faces.items():
+        face_center = tuple(sum(point[axis] for point in coords) / len(coords) for axis in range(2))
+        if mode == "POLAR":
+            def angle(point):
+                turns = (math.atan2(point[1] - center[1], point[0] - center[0]) - operator.start_angle) / math.tau
+                return (-turns if operator.reverse_sweep else turns) % 1.0
+
+            anchor = angle(face_center)
+            polar = []
+            for point in coords:
+                distance = math.dist(point, center)
+                turns = anchor if distance <= 1e-10 else angle(point)
+                turns = anchor + (turns - anchor + 0.5) % 1.0 - 0.5
+                polar.append((turns, distance / radius if radius > 1e-10 else 0.0))
+            result[index] = polar
+        else:
+            constant = phase(face_center) if operator.per_face_phase else None
+            values = [phase(point) if constant is None else constant for point in coords]
+            result[index] = [(value, point[1]) if output_axis == 0 else (point[0], value)
+                             for point, value in zip(coords, values)]
+    return result
+
+
+class OBJECT_OT_uvfx_face_uv(bpy.types.Operator):
+    bl_idname = "object.uvfx_face_uv"
+    bl_label = "处理所选面 UV"
+    bl_options = {"REGISTER", "UNDO"}
+
+    operation: bpy.props.EnumProperty(name="模式", items=(
+        ("SCALE", "按面缩放", "围绕每个面的 UV 中心缩放"),
+        ("FILL", "每面铺满", "将每个面的 UV 包围盒映射到 0–1"),
+        ("POINT", "每面压成点", "收拢到各面自己的 UV 中心"),
+        ("MOVE", "移动选区", "平移选中面的 UV"),
+        ("ROTATE", "旋转选区", "围绕选区中心旋转"),
+        ("GROUP_SCALE", "缩放选区", "围绕选区中心整体缩放"),
+        ("LINEAR", "直线扫描", "沿指定方向将 0–1 的进度写入 U 或 V"),
+        ("RADIAL", "径向扫描", "由中心向外将 0–1 的进度写入 U 或 V"),
+        ("POLAR", "极坐标", "U 为角度，V 为到中心的距离"),
+        ("RANDOM", "随机排布", "可按面保形、按面压点或按顶点随机"),
+    ))
+    sweep_direction: bpy.props.EnumProperty(name="方向", default="RIGHT", items=(
+        ("RIGHT", "左 → 右", ""), ("LEFT", "右 → 左", ""),
+        ("DOWN", "上 → 下", ""), ("UP", "下 → 上", ""),
+    ))
+    sweep_channel: bpy.props.EnumProperty(name="写入轴", default="U", items=(("U", "U", ""), ("V", "V", "")))
+    per_face_phase: bpy.props.BoolProperty(name="逐面定值", description="同一面写入同一个进度值，适合阵列逐格触发")
+    reverse_sweep: bpy.props.BoolProperty(name="反向")
+    use_custom_center: bpy.props.BoolProperty(name="自定义中心")
+    layout_center: bpy.props.FloatVectorProperty(name="中心 U/V", size=2, default=(0.5, 0.5), step=1)
+    start_angle: bpy.props.FloatProperty(name="起始角度", subtype="ANGLE")
+    seed: bpy.props.IntProperty(name="随机种子", default=0, min=0)
+    random_mode: bpy.props.EnumProperty(name="随机方式", default="FACE_SHAPE", items=(
+        ("FACE_SHAPE", "逐面保形", "每个面整体移动到随机位置，保留 UV 形状与尺寸"),
+        ("FACE_POINT", "逐面压点", "每个面收拢成一个随机 UV 点"),
+        ("VERTEX", "逐顶点", "每个网格顶点一个随机位置，所选面共享的顶点保持一致"),
+        ("SHUFFLE", "随机换格（不重叠）", "打乱等尺寸 UV 格位，不改变整体排布"),
+    ))
+    pivot: bpy.props.EnumProperty(name="锚点", default="SELECTION", items=(
+        ("SELECTION", "选区中心", ""),
+        ("BOUNDS", "选区包围盒中心", ""),
+        ("TILE", "UV 格中心 (0.5, 0.5)", ""),
+        ("ORIGIN", "UV 原点 (0, 0)", ""),
+        ("FACE", "各面中心", ""),
+        ("CUSTOM", "自定义 U/V", ""),
+    ))
+    pivot_uv: bpy.props.FloatVectorProperty(name="锚点 U/V", size=2, default=(0.5, 0.5), step=1)
+    interactive: bpy.props.BoolProperty(options={"HIDDEN", "SKIP_SAVE"})
+    translation: bpy.props.FloatVectorProperty(name="位移 U/V", size=2, step=1)
+    angle: bpy.props.FloatProperty(name="旋转角度", subtype="ANGLE")
+    scale: bpy.props.FloatVectorProperty(name="缩放 U/V", size=2, default=(1.0, 1.0), min=0, step=1)
+
+    linked: bpy.props.BoolProperty(name="联动 U/V", default=True)
+    uniform_scale: bpy.props.FloatProperty(name="统一缩放", default=1.0, min=0, step=1)
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "EDIT_MESH"
+
+    def invoke(self, context, event):
+        import bmesh
+
+        mesh = context.edit_object.data
+        editable = bmesh.from_edit_mesh(mesh)
+        layer = editable.loops.layers.uv.active
+        if not layer or not any(face.select and not face.hide for face in editable.faces):
+            self.report({"WARNING"}, "请先选面，并确认当前网格有 UV")
+            return {"CANCELLED"}
+        self._baseline = {index: [tuple(loop[layer].uv) for loop in face.loops]
+                          for index, face in enumerate(editable.faces) if face.select and not face.hide}
+        self._mesh = mesh
+        self._layer_name = layer.name
+        if self.interactive:
+            self.translation = (0.0, 0.0)
+            self.angle = 0.0
+            self.scale = (1.0, 1.0)
+            self.linked = False
+            self._mouse_start = (event.mouse_x, event.mouse_y)
+            self._axis = None
+            context.area.header_text_set("UV：移动鼠标 · X/Y 限轴（移动/缩放） · 左键确认 · Esc 取消")
+            context.window_manager.modal_handler_add(self)
+            return {"RUNNING_MODAL"}
+        return context.window_manager.invoke_props_dialog(self, title={
+            "MOVE": "移动 UV", "ROTATE": "旋转 UV", "GROUP_SCALE": "缩放 UV",
+            "LINEAR": "直线扫描", "RADIAL": "径向扫描", "POLAR": "极坐标 UV", "RANDOM": "随机排布",
+        }.get(self.operation, self.bl_label))
+
+    def modal(self, context, event):
+        if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
+            context.area.header_text_set(None)
+            self.cancel(context)
+            return {"CANCELLED"}
+        if event.type in {"LEFTMOUSE", "RET", "NUMPAD_ENTER"} and event.value == "PRESS":
+            context.area.header_text_set(None)
+            return self.execute(context)
+        if event.value == "PRESS" and event.type in {"X", "Y"} and self.operation != "ROTATE":
+            self._axis = None if self._axis == event.type else event.type
+        elif event.type != "MOUSEMOVE":
+            return {"RUNNING_MODAL"}
+        delta_x = (event.mouse_x - self._mouse_start[0]) / 270
+        delta_y = (event.mouse_y - self._mouse_start[1]) / 270
+        if self.operation == "MOVE":
+            self.translation = (delta_x if self._axis != "Y" else 0.0,
+                                delta_y if self._axis != "X" else 0.0)
+        elif self.operation == "ROTATE":
+            self.angle = delta_x * math.pi
+        else:
+            factor = max(0.0, 1.0 + delta_x)
+            self.scale = (factor if self._axis != "Y" else 1.0,
+                          factor if self._axis != "X" else 1.0)
+        self.check(context)
+        return {"RUNNING_MODAL"}
+
+    def restore_dialog_uv(self):
+        import bmesh
+
+        mesh = getattr(self, "_mesh", None)
+        baseline = getattr(self, "_baseline", None)
+        self._mesh = None
+        self._baseline = None
+        if mesh is None or baseline is None:
+            return
+        try:
+            if not mesh.is_editmode:
+                return
+            editable = bmesh.from_edit_mesh(mesh)
+        except ReferenceError:
+            return
+        layer = editable.loops.layers.uv.get(self._layer_name)
+        if layer:
+            for index, face in enumerate(editable.faces):
+                coords = baseline.get(index)
+                if coords:
+                    for loop, coord in zip(face.loops, coords):
+                        loop[layer].uv = coord
+            bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+
+    def check(self, context):
+        self.apply_uv(context, preview=True)
+        return True
+
+    def cancel(self, context):
+        self.restore_dialog_uv()
+        if context.edit_object:
+            context.edit_object.update_tag()
+        if context.screen:
+            for area in context.screen.areas:
+                area.tag_redraw()
+
+    def draw(self, context):
+        if self.operation in {"SCALE", "POINT", "FILL"}:
+            self.layout.prop(self, "operation")
+        if self.operation in {"ROTATE", "GROUP_SCALE"}:
+            self.layout.prop(self, "pivot")
+            if self.pivot == "CUSTOM":
+                self.layout.prop(self, "pivot_uv")
+        if self.operation in {"SCALE", "GROUP_SCALE"}:
+            self.layout.prop(self, "linked")
+            self.layout.prop(self, "uniform_scale" if self.linked else "scale")
+        elif self.operation == "MOVE":
+            self.layout.prop(self, "translation")
+        elif self.operation == "ROTATE":
+            self.layout.prop(self, "angle")
+        if self.operation == "LINEAR":
+            self.layout.prop(self, "sweep_direction")
+        if self.operation in {"RADIAL", "POLAR"}:
+            row = self.layout.row(align=True)
+            row.prop(self, "use_custom_center")
+            row.prop(self, "reverse_sweep")
+            if self.use_custom_center:
+                self.layout.prop(self, "layout_center")
+        if self.operation in {"LINEAR", "RADIAL"}:
+            row = self.layout.row(align=True)
+            row.prop(self, "sweep_channel", expand=True)
+            row.prop(self, "per_face_phase")
+        if self.operation == "POLAR":
+            self.layout.prop(self, "start_angle")
+            self.layout.label(text="U：角度 · V：半径；贴图采样建议 Repeat")
+        if self.operation == "RANDOM":
+            self.layout.prop(self, "random_mode")
+            self.layout.prop(self, "seed")
+            if self.random_mode == "SHUFFLE":
+                self.layout.label(text="需要等尺寸且不重叠的原始格位")
+        self.layout.label(text="实时预览 · 取消恢复本次修改")
+
+    def execute(self, context):
+        self.restore_dialog_uv()
+        return self.apply_uv(context)
+
+    def apply_uv(self, context, preview=False):
+        import bmesh
+
+        mesh = context.edit_object.data
+        editable = bmesh.from_edit_mesh(mesh)
+        input_layer = editable.loops.layers.uv.active
+        if input_layer is None:
+            self.report({"WARNING"}, "当前网格没有 UV 层")
+            return {"CANCELLED"}
+        source_name = input_layer.name
+
+        baseline = getattr(self, "_baseline", None) if preview else None
+        scale = (self.uniform_scale,) * 2 if self.linked else self.scale
+        group_center = (0.0, 0.0)
+        if self.operation in {"ROTATE", "GROUP_SCALE"} and self.pivot == "CUSTOM":
+            group_center = tuple(self.pivot_uv)
+        elif self.operation in {"ROTATE", "GROUP_SCALE"} and self.pivot == "TILE":
+            group_center = (0.5, 0.5)
+        elif self.operation in {"ROTATE", "GROUP_SCALE"} and self.pivot in {"SELECTION", "BOUNDS"}:
+            points = (coord for coords in baseline.values() for coord in coords) if baseline is not None else (
+                tuple(loop[input_layer].uv) for face in editable.faces
+                if face.select and not face.hide for loop in face.loops
+            )
+            unique = set(points)
+            if unique and self.pivot == "BOUNDS":
+                group_center = tuple((min(coord[axis] for coord in unique) +
+                                      max(coord[axis] for coord in unique)) / 2 for axis in range(2))
+            elif unique:
+                group_center = tuple(sum(coord[axis] for coord in unique) / len(unique) for axis in range(2))
+        cosine, sine = math.cos(self.angle), math.sin(self.angle)
+        selected = baseline if baseline is not None else {
+            index: [tuple(loop[input_layer].uv) for loop in face.loops]
+            for index, face in enumerate(editable.faces) if face.select and not face.hide
+        }
+        face_vertices = None
+        if self.operation == "RANDOM" and self.random_mode == "VERTEX":
+            editable.verts.index_update()
+            face_vertices = {index: [loop.vert.index for loop in face.loops]
+                             for index, face in enumerate(editable.faces) if index in selected}
+        results = build_uv_layout(self, selected, face_vertices) if self.operation in _UV_LAYOUT_MODES and selected else {}
+        if results is None:
+            if not preview:
+                self.report({"WARNING"}, "随机换格需要等尺寸且不重叠的 UV 格位；请先恢复规则 UV")
+                return {"CANCELLED"}
+            results = selected
+        skipped = 0
+        for index, coords in (() if self.operation in _UV_LAYOUT_MODES else selected.items()):
+            center = tuple(sum(coord[axis] for coord in coords) / len(coords) for axis in range(2))
+            if self.operation == "MOVE":
+                values = [tuple(coord[axis] + self.translation[axis] for axis in range(2)) for coord in coords]
+            elif self.operation == "ROTATE":
+                pivot_u, pivot_v = center if self.pivot == "FACE" else group_center
+                values = [(pivot_u + (u - pivot_u) * cosine - (v - pivot_v) * sine,
+                           pivot_v + (u - pivot_u) * sine + (v - pivot_v) * cosine) for u, v in coords]
+            elif self.operation == "POINT":
+                values = [center] * len(coords)
+            elif self.operation in {"SCALE", "GROUP_SCALE"}:
+                if self.operation == "GROUP_SCALE" and self.pivot != "FACE":
+                    center = group_center
+                values = [tuple(center[axis] + (coord[axis] - center[axis]) * scale[axis]
+                                for axis in range(2)) for coord in coords]
+            else:
+                lower = tuple(min(coord[axis] for coord in coords) for axis in range(2))
+                span = tuple(max(coord[axis] for coord in coords) - lower[axis] for axis in range(2))
+                if len(coords) != 4 or min(span) < 1e-8:
+                    skipped += 1
+                    if preview:
+                        results[index] = coords
+                    continue
+                values = [tuple((coord[axis] - lower[axis]) / span[axis] for axis in range(2))
+                          for coord in coords]
+            results[index] = values
+
+        if not results and preview:
+            return {"CANCELLED"}
+        if not results:
+            self.report({"WARNING"}, "没有可处理的选中面；铺满模式需要非退化四边面")
+            return {"CANCELLED"}
+        if preview:
+            for index, face in enumerate(editable.faces):
+                if index in results:
+                    for loop, coord in zip(face.loops, results[index]):
+                        loop[input_layer].uv = coord
+            bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+            context.edit_object.update_tag()
+            if context.screen:
+                for area in context.screen.areas:
+                    if area.type in {"VIEW_3D", "IMAGE_EDITOR"}:
+                        area.tag_redraw()
+            return {"FINISHED"}
+        backups = mesh.get("_uvfx_face_uv_backup")
+        if backups is None:
+            mesh["_uvfx_face_uv_backup"] = {}
+            backups = mesh["_uvfx_face_uv_backup"]
+        signature = face_uv_topology(editable)
+        if source_name in backups and backups[source_name]["topology"] != signature:
+            self.report({"WARNING"}, "拓扑已变化，旧的逐面 UV 备份不再适用；请先撤销拓扑修改")
+            return {"CANCELLED"}
+        if source_name not in backups:
+            backups[source_name] = {
+                "topology": signature,
+                "coords": [coordinate for face in editable.faces for loop in face.loops
+                           for coordinate in loop[input_layer].uv],
+            }
+        for index, face in enumerate(editable.faces):
+            if index in results:
+                for loop, coord in zip(face.loops, results[index]):
+                    loop[input_layer].uv = coord
+        refresh_face_uv(context, mesh, source_name)
+        self.report({"INFO"}, f"已修改 {len(results)} 个面，跳过 {skipped} 个面")
+        return {"FINISHED"}
+
+
+class VIEW3D_PT_uvfx_common_uv(bpy.types.Panel):
+    bl_label = "常用 UV 工具"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "UV Effects"
+    bl_parent_id = "VIEW3D_PT_uv_effects"
+    bl_order = -10
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        if context.mode != "EDIT_MESH":
+            layout.label(text="进入编辑模式，选择要处理的面", icon="INFO")
+            return
+
+        transform = layout.box()
+        transform.label(text="选区变换", icon="ORIENTATION_GLOBAL")
+        transform.label(text="Shift+Alt + G / R / S")
+        row = transform.row(align=True)
+        for operation, label in (("MOVE", "移动"), ("ROTATE", "旋转"), ("GROUP_SCALE", "缩放")):
+            row.operator(OBJECT_OT_uvfx_face_uv.bl_idname, text=label).operation = operation
+
+        unwrap = layout.box()
+        unwrap.label(text="展开与投影", icon="UV")
+        row = unwrap.row(align=True)
+        row.operator("uv.unwrap", text="展开")
+        row.operator("uv.smart_project", text="智能投影")
+        row = unwrap.row(align=True)
+        row.operator("uv.project_from_view", text="从视图投影")
+        row.operator("uv.follow_active_quads", text="跟随活动四边面")
+
+        reset = layout.box()
+        reset.label(text="重置选中面", icon="LOOP_BACK")
+        reset.operator("uv.reset", text="重置 UV 坐标")
+
+
+class VIEW3D_PT_uvfx_layout(bpy.types.Panel):
+    bl_label = "UV 排布"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "UV Effects"
+    bl_parent_id = "VIEW3D_PT_uv_effects"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        if context.mode != "EDIT_MESH":
+            layout.label(text="在编辑模式选中要排布的面", icon="INFO")
+            return
+        layout.label(text="按当前 UV 位置计算，仅修改所选面")
+        row = layout.row(align=True)
+        row.operator(OBJECT_OT_uvfx_face_uv.bl_idname, text="直线扫描").operation = "LINEAR"
+        row.operator(OBJECT_OT_uvfx_face_uv.bl_idname, text="径向扫描").operation = "RADIAL"
+        row = layout.row(align=True)
+        row.operator(OBJECT_OT_uvfx_face_uv.bl_idname, text="极坐标").operation = "POLAR"
+        row.operator(OBJECT_OT_uvfx_face_uv.bl_idname, text="随机排布").operation = "RANDOM"
+        layout.operator(OBJECT_OT_uvfx_restore_face_uv.bl_idname)
+
+
+class VIEW3D_PT_uvfx_face_uv(bpy.types.Panel):
+    bl_label = "逐面 UV"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "UV Effects"
+    bl_parent_id = "VIEW3D_PT_uv_effects"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        self.layout.label(text="直接修改当前 UV 层的选中面")
+        row = self.layout.row(align=True)
+        row.operator(OBJECT_OT_uvfx_face_uv.bl_idname).operation = "SCALE"
+        row.operator(OBJECT_OT_uvfx_restore_face_uv.bl_idname)
+
+
 CLASSES = (OBJECT_OT_uv_effects_add, OBJECT_OT_uv_effects_demo, OBJECT_OT_uv_effects_reset,
            OBJECT_OT_uv_effects_texture, OBJECT_OT_uv_effects_rotate, OBJECT_OT_uvfx_mesh,
-           VIEW3D_PT_uv_effects, VIEW3D_PT_uvfx_mesh)
+           OBJECT_OT_uvfx_face_uv, OBJECT_OT_uvfx_restore_face_uv,
+           VIEW3D_PT_uvfx_mesh, VIEW3D_PT_uv_effects, VIEW3D_PT_uvfx_common_uv,
+           VIEW3D_PT_uvfx_layout, VIEW3D_PT_uvfx_face_uv, VIEW3D_PT_uvfx_vertex_color)
+
+
+_uvfx_transform_keys = []
 
 
 def register():
@@ -1242,6 +1860,15 @@ def register():
     bpy.types.WindowManager.uvfx_flow_strength = bpy.props.FloatProperty(name="扭曲强度", default=0.1, update=update_texture_transform)
     for cls in CLASSES:
         bpy.utils.register_class(cls)
+    keyconfig = bpy.context.window_manager.keyconfigs.addon
+    if keyconfig:
+        keymap = keyconfig.keymaps.new(name="Mesh", space_type="EMPTY")
+        for key, operation in (("G", "MOVE"), ("R", "ROTATE"), ("S", "GROUP_SCALE")):
+            item = keymap.keymap_items.new(OBJECT_OT_uvfx_face_uv.bl_idname, key, "PRESS",
+                                           shift=True, alt=True)
+            item.properties.operation = operation
+            item.properties.interactive = True
+            _uvfx_transform_keys.append((keymap, item))
     bpy.types.WindowManager.uv_effects_image = bpy.props.PointerProperty(
         type=bpy.types.Image, update=update_preview_image
     )
@@ -1277,6 +1904,9 @@ def register():
 
 def unregister():
     global _preview_handle, _seam_handle
+    for keymap, item in _uvfx_transform_keys:
+        keymap.keymap_items.remove(item)
+    _uvfx_transform_keys.clear()
     if _seam_handle is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_seam_handle, "WINDOW")
         _seam_handle = None
